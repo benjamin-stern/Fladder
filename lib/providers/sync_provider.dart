@@ -37,6 +37,7 @@ import 'package:fladder/providers/connectivity_provider.dart';
 import 'package:fladder/providers/service_provider.dart';
 import 'package:fladder/providers/settings/client_settings_provider.dart';
 import 'package:fladder/providers/sync/background_download_provider.dart';
+import 'package:fladder/providers/sync/download_logger.dart';
 import 'package:fladder/providers/user_provider.dart';
 import 'package:fladder/screens/shared/fladder_snackbar.dart';
 import 'package:fladder/util/duration_extensions.dart';
@@ -443,23 +444,29 @@ class SyncNotifier extends StateNotifier<SyncSettingsModel> {
     } catch (e) {
       log('Error updating item: ${syncedItem.id}');
       syncedItem = syncedItem.copyWith(unSyncedData: true);
+      DownloadLogger.error('UpdateItem failed', taskId: syncedItem.id, error: e);
     }
     return _db.insertItem(syncedItem);
   }
 
   Future<SyncedItem> deleteFullSyncFiles(SyncedItem syncedItem, DownloadTask? task) async {
+    DownloadLogger.log('DeleteFullSyncFiles start id=${syncedItem.id}');
     await syncedItem.deleteDatFiles(ref);
 
     ref.read(downloadTasksProvider(syncedItem.id).notifier).update((state) => DownloadStream.empty());
+    DownloadLogger.log('DownloadStream reset id=${syncedItem.id}');
 
     ref.read(backgroundDownloaderProvider).cancelTaskWithId(syncedItem.id);
+    DownloadLogger.log('Background task canceled id=${syncedItem.id}');
 
     cleanupTemporaryFiles();
+    DownloadLogger.log('Temporary files cleanup after delete id=${syncedItem.id}');
     refresh();
     return syncedItem;
   }
 
   Future<bool?> syncFile(SyncedItem syncItem, bool skipDownload) async {
+    DownloadLogger.log('SYNCFILE start id=${syncItem.id} skip=$skipDownload path=${syncItem.directory.path}');
     cleanupTemporaryFiles();
 
     final playbackResponse = await api.itemsItemIdPlaybackInfoPost(
@@ -471,16 +478,21 @@ class SyncNotifier extends StateNotifier<SyncSettingsModel> {
         deviceProfile: ref.read(videoProfileProvider),
       ),
     );
+    DownloadLogger.log('PlaybackInfo retrieved id=${syncItem.id} success=${playbackResponse.isSuccessful}');
 
     final item = syncItem.createItemModel(ref);
+  DownloadLogger.log('Item model created id=${syncItem.id} type=${item?.runtimeType}');
 
     final directory = await Directory(syncItem.directory.path).create(recursive: true);
+  DownloadLogger.log('Directory ensured id=${syncItem.id} exists=${directory.existsSync()} path=${directory.path}');
 
     final newState = VideoStream.fromPlayBackInfo(playbackResponse.bodyOrThrow, ref)?.copyWith();
     final subtitles = await saveExternalSubtitles(newState?.mediaStreamsModel?.subStreams, syncItem);
+  DownloadLogger.log('VideoStream parsed id=${syncItem.id} mediaStreams=${newState?.mediaStreamsModel != null} externalSubtitles=${subtitles.length}');
 
     final trickPlayFile = await saveTrickPlayData(item, directory);
     final mediaSegments = (await api.mediaSegmentsGet(id: syncItem.id))?.body;
+  DownloadLogger.log('TrickPlay saved id=${syncItem.id} hasTrickPlay=${trickPlayFile != null} mediaSegmentsModelPresent=${mediaSegments != null}');
 
     syncItem = syncItem.copyWith(
       fChapters: await saveChapterImages(item?.overview.chapters, directory) ?? [],
@@ -488,11 +500,14 @@ class SyncNotifier extends StateNotifier<SyncSettingsModel> {
       fTrickPlayModel: trickPlayFile,
       mediaSegments: mediaSegments,
     );
+    DownloadLogger.log('SyncItem enriched id=${syncItem.id} chapters=${syncItem.fChapters.length} subtitles=${syncItem.subtitles.length}');
 
     await updateItem(syncItem);
+  DownloadLogger.log('User item metadata persisted id=${syncItem.id}');
 
     final currentTask = ref.read(downloadTasksProvider(syncItem.id));
     final user = ref.read(userProvider);
+  DownloadLogger.log('Pre-enqueue state id=${syncItem.id} hasExistingTask=${currentTask.task != null} status=${currentTask.status} userNull=${user == null}');
 
     if (user == null) return null;
 
@@ -501,8 +516,12 @@ class SyncNotifier extends StateNotifier<SyncSettingsModel> {
     try {
       if (currentTask.task != null) {
         await ref.read(backgroundDownloaderProvider).cancelTaskWithId(currentTask.id);
+        DownloadLogger.log('Canceled existing task before re-enqueue id=${syncItem.id}');
       }
       if (!skipDownload) {
+          DownloadLogger.log('Sanitized filename from "$rawFilename" to "$safeFilename"', taskId: syncItem.id);
+          DownloadLogger.log('Persisted sanitized filename id=${syncItem.id} fileName=$safeFilename');
+        }
         final downloadTask = DownloadTask(
           taskId: syncItem.id,
           url: Uri.parse(downloadUrl).toString(),
@@ -516,13 +535,17 @@ class SyncNotifier extends StateNotifier<SyncSettingsModel> {
           retries: 3,
           allowPause: true,
         );
+        DownloadLogger.log('DownloadTask created id=${syncItem.id} url=$downloadUrl file=${syncItem.videoFileName} dir=${syncItem.directory.path} wifiRequired=${ref.read(clientSettingsProvider.select((v) => v.requireWifi))}');
 
         final defaultDownloadStream = DownloadStream(id: syncItem.id, task: downloadTask, status: TaskStatus.enqueued);
         ref.read(downloadTasksProvider(syncItem.id).notifier).update((state) => defaultDownloadStream);
-        return await ref.read(backgroundDownloaderProvider).enqueue(downloadTask);
+        final enqueueResult = await ref.read(backgroundDownloaderProvider).enqueue(downloadTask);
+        DownloadLogger.log('Enqueue result id=${syncItem.id} success=$enqueueResult');
+        return enqueueResult;
       }
     } catch (e) {
       log(e.toString());
+      DownloadLogger.error('syncFile exception', taskId: syncItem.id, error: e);
       return null;
     }
 
